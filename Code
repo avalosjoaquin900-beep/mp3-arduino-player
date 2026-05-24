@@ -1,0 +1,350 @@
+/*
+ * ============================================================================
+ * MP3 Player Project - Arduino Pro Mini + DFPlayer Mini + OLED SSD1306
+ * ============================================================================
+ * Description: Portable MP3 player with track selection, volume control,
+ *              and real-time OLED display feedback.
+ * Author: Joaquin Avalos
+ * Last Modified: 2026
+ * ============================================================================
+ */
+
+// ============================================================================
+// LIBRARY INCLUDES / INCLUSIÓN DE LIBRERÍAS
+// ============================================================================
+#include <DFRobotDFPlayerMini.h>    // DFPlayer Mini control library
+#include <Wire.h>                    // I2C communication for OLED
+#include <SoftwareSerial.h>          // Software UART for DFPlayer (GPIO pins 10, 11)
+#include <Adafruit_GFX.h>            // Graphics library for OLED
+#include <Adafruit_SSD1306.h>        // OLED SSD1306 driver
+
+
+// ============================================================================
+// HARDWARE PIN CONFIGURATION / CONFIGURACIÓN DE PINES
+// ============================================================================
+
+// Software Serial pins for DFPlayer communication
+// RX pin (Arduino) -> DFPlayer TX | TX pin (Arduino) -> DFPlayer RX
+// Pin 10 = RX (receives data from DFPlayer)
+// Pin 11 = TX (transmits data to DFPlayer)
+SoftwareSerial conected(10, 11);
+
+// Button input pins with INPUT_PULLUP configuration
+#define BUTTON_A 8   // Play/Pause button
+#define BUTTON_B 9   // Up/Volume Up (long press)
+#define BUTTON_C 7   // Down/Volume Down (long press)
+#define BUTTON_D 6   // Previous track
+#define BUTTON_E 5   // Next track
+
+
+// ============================================================================
+// DISPLAY CONFIGURATION / CONFIGURACIÓN DE PANTALLA
+// ============================================================================
+#define ANCHO_PANTALLA 128           // OLED width in pixels
+#define ALTO_PANTALLA 64             // OLED height in pixels
+
+// Initialize OLED display (128x64, I2C address 0x3C)
+Adafruit_SSD1306 display(ANCHO_PANTALLA, ALTO_PANTALLA, &Wire, -1);
+
+
+// ============================================================================
+// AUDIO & PLAYLIST CONFIGURATION / CONFIGURACIÓN DE AUDIO Y PLAYLIST
+// ============================================================================
+
+// Array of track filenames stored in SD card root folder
+// Files must be named sequentially (001.mp3, 002.mp3, etc.)
+String jazz[] = {"001.mp3", "002.mp3", "003.mp3", "004.mp3"};
+
+// Index for current track selection (0-based)
+int firstrack = 0;
+
+
+// ============================================================================
+// STATE MANAGEMENT VARIABLES / VARIABLES DE GESTIÓN DE ESTADO
+// ============================================================================
+
+// Timestamp variables for debouncing and long-press detection
+// Stores milliseconds when button was pressed (used to detect hold duration)
+unsigned long presstime_B = 0;   // Button B press timestamp
+unsigned long presstime_C = 0;   // Button C press timestamp
+
+// Long-press flags to prevent multiple triggers during sustained press
+bool longPress_B = false;        // Button B long-press flag (prevents repeat)
+bool longPress_C = false;        // Button C long-press flag (prevents repeat)
+
+// Audio playback state
+bool isPlaying = false;          // Current playback status (true = playing)
+int volumen = 20;                // Current volume level (0-30)
+
+// Previous button states for edge detection (debouncing)
+// Detects LOW->HIGH and HIGH->LOW transitions to trigger actions
+int estadoAnterior_A = HIGH;     // Previous state of BUTTON_A
+int estadoAnterior_B = HIGH;     // Previous state of BUTTON_B
+int estadoAnterior_C = HIGH;     // Previous state of BUTTON_C
+int estadoAnterior_D = HIGH;     // Previous state of BUTTON_D
+int estadoAnterior_E = HIGH;     // Previous state of BUTTON_E
+
+
+// ============================================================================
+// DFPLAYER INSTANCE / INSTANCIA DEL DFPLAYER
+// ============================================================================
+DFRobotDFPlayerMini repro;       // DFPlayer Mini object for audio control
+
+
+// ============================================================================
+// SETUP FUNCTION / FUNCIÓN SETUP
+// ============================================================================
+void setup() {
+  // Initialize all button pins as input with internal pull-up resistors
+  // Pull-up: pin reads HIGH by default, goes LOW when button is pressed
+  pinMode(BUTTON_A, INPUT_PULLUP);
+  pinMode(BUTTON_B, INPUT_PULLUP);
+  pinMode(BUTTON_C, INPUT_PULLUP);
+  pinMode(BUTTON_D, INPUT_PULLUP);
+  pinMode(BUTTON_E, INPUT_PULLUP);
+
+  // Initialize hardware UART for debugging and serial communication
+  Serial.begin(9600);
+  Serial.println("OLED Initialization Test");
+
+  // Initialize OLED display at I2C address 0x3C
+  // SWITCHCAPVCC: internal voltage regulator mode
+  // Returns false if display not found (communication failure)
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("ERROR: OLED Display initialization failed");
+    while (1);  // Halt execution if display fails
+  }
+  Serial.println("OLED initialized successfully");
+  display.display();  // Turn on display
+
+  // Configure DFPlayer audio parameters
+  repro.volume(30);                    // Set initial volume to 30 (max)
+  repro.EQ(DFPLAYER_EQ_NORMAL);        // Set equalizer to normal mode
+  repro.outputDevice(DFPLAYER_DEVICE_SD); // Use SD card as audio source
+
+  // Initialize DFPlayer with software serial connection
+  // Communication: 9600 baud, uses pins 10 (RX) and 11 (TX)
+  repro.begin(conected);
+  Serial.println();
+
+  // Delay for peripheral stabilization before first display update
+  delay(1000);
+
+  // Draw initial menu on OLED
+  drawmenu();
+}
+
+
+// ============================================================================
+// MENU DISPLAY FUNCTION / FUNCIÓN PARA MOSTRAR MENÚ
+// ============================================================================
+/*
+ * Renders the track selection menu on OLED display
+ * Shows 4 tracks with a ">" indicator for the currently selected track
+ * 
+ * Display Layout:
+ * Row 0: > 001.mp3  (if selected)
+ * Row 1:   002.mp3
+ * Row 2:   003.mp3
+ * Row 3:   004.mp3
+ */
+void drawmenu() {
+  display.setTextSize(1);           // Font size: 1x scale (5x7 pixels per char)
+  display.setTextColor(SSD1306_WHITE); // Set text color to white
+  display.clearDisplay();           // Clear OLED framebuffer
+
+  // Iterate through all tracks in the jazz array
+  for (int i = 0; i < 4; i++) {
+    display.setCursor(0, i * 8);    // Set cursor position: X=0, Y=row*8 pixels
+
+    // Highlight currently selected track with ">" symbol
+    if (firstrack == i) {
+      display.println(">" + jazz[i]); // Prefix with ">" indicator
+    } else {
+      display.println(" " + jazz[i]);  // Prefix with space (alignment)
+    }
+  }
+
+  // Send framebuffer to OLED display (render changes)
+  display.display();
+}
+
+
+// ============================================================================
+// NOW PLAYING DISPLAY FUNCTION / FUNCIÓN PARA MOSTRAR REPRODUCCIÓN
+// ============================================================================
+/*
+ * Renders the now-playing screen with playback status
+ * 
+ * Display Elements:
+ * - Play/Pause icon (triangle or bars)
+ * - Current track name
+ * - Playback status text ("reproduciendo" or "pausado")
+ */
+void drawnowplaying() {
+  display.clearDisplay();
+
+  // Draw play/pause icon based on current playback state
+  if (isPlaying) {
+    // Triangle icon (play symbol): vertices at (10,8), (10,28), (25,18)
+    display.fillTriangle(10, 8, 10, 28, 25, 18, SSD1306_WHITE);
+  } else {
+    // Pause icon: two vertical bars
+    display.fillRect(8, 8, 6, 20, SSD1306_WHITE);   // Left bar
+    display.fillRect(18, 8, 6, 20, SSD1306_WHITE);  // Right bar
+  }
+
+  // Display current track name
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 40);
+  display.println(jazz[firstrack]);
+
+  // Display playback status text
+  display.setCursor(0, 52);
+  display.println(isPlaying ? "reproduciendo" : "pausado");
+
+  // Render changes to OLED display
+  display.display();
+}
+
+
+// ============================================================================
+// MAIN LOOP / LOOP PRINCIPAL
+// ============================================================================
+void loop() {
+
+  // ==========================================================================
+  // BUTTON B LOGIC: Up Menu Navigation / Volume Increase
+  // Función: Navegar hacia arriba en el menú o subir volumen (presión larga)
+  // ==========================================================================
+
+  // Read current state of BUTTON_B (digital pin 9)
+  int estadoActual_B = digitalRead(BUTTON_B);
+
+  // EDGE DETECTION: Falling edge (button press)
+  // Condition: Current=LOW (pressed) AND Previous=HIGH (not pressed)
+  // Purpose: Capture moment of button press, reset long-press timer
+  if (estadoActual_B == LOW && estadoAnterior_B == HIGH) {
+    presstime_B = millis();      // Record press timestamp (in milliseconds)
+    longPress_B = false;         // Reset long-press flag
+  }
+
+  // LONG-PRESS DETECTION: Button held > 500ms
+  // Condition: Button still pressed AND time elapsed > 500ms AND first trigger
+  // Action: Increase volume, prevent repeat triggers with longPress flag
+  if (estadoActual_B == LOW && (millis() - presstime_B > 500) && !longPress_B) {
+    longPress_B = true;          // Prevent multiple triggers during hold
+    volumen++;                   // Increment volume level
+    if (volumen > 30) volumen = 30; // Clamp volume to maximum (30)
+    repro.volume(volumen);       // Apply volume change to DFPlayer
+  }
+
+  // RISING EDGE: Button release (only if not a long-press)
+  // Condition: Current=HIGH (released) AND Previous=LOW (was pressed) AND short press
+  // Action: Navigate menu upward (next track)
+  if (estadoActual_B == HIGH && estadoAnterior_B == LOW && !longPress_B) {
+    firstrack++;                 // Move to next track
+    if (firstrack > 3) firstrack = 0; // Wrap around to first track
+    drawmenu();                  // Update display
+  }
+
+  // Store current state for next iteration (edge detection)
+  estadoAnterior_B = estadoActual_B;
+
+
+  // ==========================================================================
+  // BUTTON C LOGIC: Down Menu Navigation / Volume Decrease
+  // Función: Navegar hacia abajo en el menú o bajar volumen (presión larga)
+  // ==========================================================================
+
+  int estadoActual_C = digitalRead(BUTTON_C);
+
+  // EDGE DETECTION: Button press
+  if (estadoActual_C == LOW && estadoAnterior_C == HIGH) {
+    presstime_C = millis();
+    longPress_C = false;
+  }
+
+  // LONG-PRESS DETECTION: Volume decrease
+  if (estadoActual_C == LOW && (millis() - presstime_C > 500) && !longPress_C) {
+    longPress_C = true;
+    volumen--;                   // Decrement volume level
+    if (volumen < 0) volumen = 0; // Clamp volume to minimum (0)
+    repro.volume(volumen);
+  }
+
+  // RISING EDGE: Menu navigation down (short press only)
+  // NOTE: Bug in original code - should check estadoActual_C instead of estadoActual_B
+  if (estadoActual_C == HIGH && estadoAnterior_C == LOW && !longPress_C) {
+    firstrack--;                 // Move to previous track
+    if (firstrack < 0) firstrack = 3; // Wrap around to last track
+    drawmenu();
+  }
+
+  estadoAnterior_C = estadoActual_C;
+
+
+  // ==========================================================================
+  // BUTTON A LOGIC: Play/Pause Toggle
+  // Función: Alternar entre reproducir y pausar la canción actual
+  // ==========================================================================
+
+  int estadoActual_A = digitalRead(BUTTON_A);
+
+  // EDGE DETECTION: Button press (falling edge only)
+  if (estadoActual_A == LOW && estadoAnterior_A == HIGH) {
+    // Toggle playback state based on current status
+    if (isPlaying) {
+      repro.pause();             // Pause current track
+      isPlaying = false;
+      drawnowplaying();          // Update display with pause icon
+    } else {
+      repro.play(firstrack + 1); // Play selected track (1-based indexing)
+      isPlaying = true;
+      Serial.println("play");    // Debug: confirm play command sent
+      drawnowplaying();
+    }
+  }
+
+  estadoAnterior_A = estadoActual_A;
+
+
+  // ==========================================================================
+  // BUTTON D LOGIC: Previous Track
+  // Función: Ir a la canción anterior (botón físico "atrás")
+  // ==========================================================================
+
+  int estadoActual_D = digitalRead(BUTTON_D);
+
+  if (estadoActual_D == LOW && estadoAnterior_D == HIGH) {
+    repro.previous();            // DFPlayer command: play previous track
+    firstrack--;                 // Update menu index
+    if (firstrack < 0) firstrack = 3; // Wrap around
+    drawnowplaying();            // Show current track on now-playing screen
+  }
+
+  estadoAnterior_D = estadoActual_D;
+
+
+  // ==========================================================================
+  // BUTTON E LOGIC: Next Track
+  // Función: Ir a la siguiente canción (botón físico "siguiente")
+  // ==========================================================================
+
+  int estadoActual_E = digitalRead(BUTTON_E);
+
+  if (estadoActual_E == LOW && estadoAnterior_E == HIGH) {
+    repro.next();                // DFPlayer command: play next track
+    firstrack++;                 // Update menu index
+    if (firstrack > 3) firstrack = 0; // Wrap around
+    drawnowplaying();
+  }
+
+  estadoAnterior_E = estadoActual_E;
+
+} // End of loop()
+
+// ============================================================================
+// END OF CODE / FIN DEL CÓDIGO
+// ============================================================================
